@@ -16,6 +16,7 @@ for (const node of ast.statements) {
       }
     }
   } else {
+    if (["readSearchCache", "writeSearchCache"].includes(node.name?.text)) continue;
     parts.push(node.getText(ast));
   }
 }
@@ -23,7 +24,7 @@ const javascript = ts.transpileModule(parts.join("\n"), {
   compilerOptions: { target: ts.ScriptTarget.ES2020 },
 }).outputText;
 
-function harness({ failLoad = false } = {}) {
+function harness({ failLoad = false, savedCache = null } = {}) {
   let finish;
   const ready = new Promise((resolve) => { finish = resolve; });
   const refs = {};
@@ -35,12 +36,17 @@ function harness({ failLoad = false } = {}) {
   refs.latestFilterTypeRef = { current: "all" };
   const updates = [];
   const failures = [];
+  const selections = [];
+  const queries = [];
   const stream = { destroyed: false, destroy() { this.destroyed = true; } };
   const dependencies = {
     ...refs, path, fs: { existsSync: () => true, statSync: () => ({ mtimeMs: 1 }) },
     ACTIVE_INDEX_FILE: "/index", CACHE_LOAD_YIELD_EVERY: 2000,
     SEARCH_CHUNK_SIZE: 1500, PARTIAL_RESULT_UPDATE_INTERVAL_MS: 32,
     maxResults: 25, filterType: "all", AbortController, setImmediate,
+    readSearchCache: async () => savedCache, writeSearchCache: async () => {},
+    setResultQuery: (query) => queries.push(query),
+    setSelectedItemPath: (selected) => selections.push(selected),
     createReadStream: () => stream,
     readline: { createInterface: () => ({
       close() {},
@@ -56,7 +62,7 @@ function harness({ failLoad = false } = {}) {
     showToast: (toast) => failures.push(toast), Toast: { Style: { Failure: "failure" } },
   };
   const api = new Function(...Object.keys(dependencies), `${javascript}\nreturn { loadCachedIndex, runSearch };`)(...Object.values(dependencies));
-  return { ...api, refs, updates, failures, finish, source: { path: "/index", mtimeMs: 1 } };
+  return { ...api, refs, updates, failures, selections, queries, finish, source: { path: "/index", mtimeMs: 1 } };
 }
 
 test("cold launch waits for the full cache before publishing results", async () => {
@@ -73,6 +79,9 @@ test("cold launch waits for the full cache before publishing results", async () 
   assert.equal(earlyUpdates, 0, "An incomplete cache must not select an early match");
   assert.equal(h.updates.at(-1)[0].path, "/media/Practical 6");
   assert.equal(h.failures.length, 0);
+  assert.equal(h.updates.length, 1);
+  assert.equal(h.selections.at(-1), "/media/Practical 6");
+  assert.equal(h.queries.at(-1), JSON.stringify(["Practical 6", "all"]));
 });
 
 test("concurrent cache readers wait for the same complete snapshot", async () => {
@@ -108,4 +117,22 @@ test("cache read failures report an error and allow retrying", async () => {
   assert.equal(h.failures[0].title, "Failed to load search index");
   assert.equal(h.refs.cachedIndexRef.current, null);
   assert.equal(h.refs.cachedIndexPromiseRef.current, null);
+});
+
+test("saved caches skip rebuilding and release the pending load", async () => {
+  const savedCache = { entries: [], prefixIndex: new Map() };
+  const h = harness({ savedCache, failLoad: true });
+  assert.equal(await h.loadCachedIndex(h.source), savedCache);
+  assert.equal(h.refs.cachedIndexPromiseRef.current, null);
+  assert.equal(h.refs.cachedIndexRef.current, savedCache);
+});
+
+test("a new search selects its best result instead of keeping the old selection", async () => {
+  const h = harness();
+  h.finish();
+  await h.runSearch("Practical6.zip");
+  assert.equal(h.selections.at(-1), "/home/Practical6.zip");
+  await h.runSearch("Practical 6");
+  assert.equal(h.selections.at(-1), "/media/Practical 6");
+  assert.notEqual(h.queries[0], h.queries[1]);
 });

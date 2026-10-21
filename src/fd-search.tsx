@@ -20,6 +20,7 @@ import { createHash } from "crypto";
 import readline from "readline";
 import path from "path";
 import { pathToFileURL } from "url";
+import { serialize, deserialize } from "v8";
 
 const execAsync = promisify(exec);
 
@@ -118,7 +119,43 @@ const MAX_REINDEX_AFTER_MINUTES = 20;
 const INDEX_REFRESH_POLL_MS = 3000;
 const CACHE_LOAD_YIELD_EVERY = 2000;
 const SEARCH_CHUNK_SIZE = 1500;
-const PARTIAL_RESULT_UPDATE_INTERVAL_MS = 32;
+const SEARCH_CACHE_FILE = path.join(environment.supportPath, "fd_search_cache.bin");
+const SEARCH_CACHE_VERSION = 1;
+
+async function readSearchCache(source: IndexSource): Promise<CachedIndexData | null> {
+  try {
+    const saved = deserialize(await fs.promises.readFile(SEARCH_CACHE_FILE));
+    if (
+      saved.version === SEARCH_CACHE_VERSION &&
+      saved.fingerprint === getIndexFingerprint(source) &&
+      saved.size === (await fs.promises.stat(source.path)).size &&
+      Array.isArray(saved.data?.entries) && saved.data?.prefixIndex instanceof Map
+    ) {
+      return saved.data;
+    }
+  } catch {
+    // A missing or outdated cache can be rebuilt from the index.
+  }
+  return null;
+}
+
+async function writeSearchCache(source: IndexSource, data: CachedIndexData) {
+  const temporaryPath = `${SEARCH_CACHE_FILE}.${process.pid}.tmp`;
+  try {
+    const size = (await fs.promises.stat(source.path)).size;
+    await fs.promises.writeFile(temporaryPath, serialize({
+      version: SEARCH_CACHE_VERSION,
+      fingerprint: getIndexFingerprint(source),
+      size,
+      data,
+    }));
+    await fs.promises.rename(temporaryPath, SEARCH_CACHE_FILE);
+  } catch {
+    // Saving this cache is optional; searching still works without it.
+  } finally {
+    await fs.promises.unlink(temporaryPath).catch(() => {});
+  }
+}
 
 function formatFileSize(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -1055,6 +1092,7 @@ export default function Command() {
   const [indexedCount, setIndexedCount] = useState<number | null>(null);
   const [selectedItemPath, setSelectedItemPath] = useState<string>("");
   const [selectedItemDetails, setSelectedItemDetails] = useState<SelectedItemDetails | null>(null);
+  const [resultQuery, setResultQuery] = useState("");
 
   const currentSearchAbort = useRef<AbortController | null>(null);
   const indexingProcess = useRef<ReturnType<typeof spawn> | null>(null);
@@ -1222,6 +1260,12 @@ export default function Command() {
 
     cachedIndexFingerprintRef.current = fingerprint;
     cachedIndexPromiseRef.current = (async () => {
+      const savedCache = await readSearchCache(source);
+      if (savedCache) {
+        cachedIndexRef.current = savedCache;
+        cachedIndexPromiseRef.current = null;
+        return savedCache;
+      }
       const cachedIndexData: CachedIndexData = {
         entries: [],
         prefixIndex: new Map<string, number[]>(),
@@ -1270,6 +1314,7 @@ export default function Command() {
           }
         }
         cachedIndexRef.current = cachedIndexData;
+        void writeSearchCache(source, cachedIndexData);
 
         return cachedIndexData;
       } finally {
@@ -1418,7 +1463,6 @@ export default function Command() {
 
     try {
       let processedCount = 0;
-      let lastResultUpdate = Date.now();
 
       for (const cachedEntry of candidateEntries) {
         if (abortSignal.aborted) {
@@ -1429,21 +1473,6 @@ export default function Command() {
         processedCount += 1;
 
         if (processedCount % SEARCH_CHUNK_SIZE === 0) {
-          const now = Date.now();
-          if (now - lastResultUpdate >= PARTIAL_RESULT_UPDATE_INTERVAL_MS) {
-            if (searchGeneration === searchGenerationRef.current && !abortSignal.aborted) {
-              setResults(
-                topMatches.map((match) => ({
-                  path: match.entry.path,
-                  isDirectory: match.entry.isDirectory,
-                  size: match.entry.size,
-                  mtimeMs: match.entry.mtimeMs,
-                  extension: match.entry.extension,
-                })),
-              );
-            }
-            lastResultUpdate = now;
-          }
           await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
@@ -1464,6 +1493,9 @@ export default function Command() {
         return;
       }
 
+      const queryKey = JSON.stringify([q, filterType]);
+      setResultQuery(queryKey);
+      setSelectedItemPath(finalResults[0]?.path ?? "");
       setResults(finalResults);
       setLoading(Boolean(cachedIndexPromiseRef.current));
     } catch (e) {
@@ -1862,7 +1894,7 @@ export default function Command() {
       searchBarPlaceholder={searchBarPlaceholder}
       navigationTitle={navigationTitle}
       onSearchTextChange={setQuery}
-      onSelectionChange={setSelectedItemPath}
+      onSelectionChange={(id) => setSelectedItemPath((JSON.parse(id) as [string, string])[1])}
       searchBarAccessory={
         <List.Dropdown tooltip="Filter by File Type" value={filterType} onChange={setFilterType}>
           <List.Dropdown.Item title="All Files" value="all" />
@@ -1973,8 +2005,8 @@ export default function Command() {
 
         return (
           <List.Item
-            key={item.path}
-            id={item.path}
+            key={JSON.stringify([resultQuery, item.path])}
+            id={JSON.stringify([resultQuery, item.path])}
             title={filename}
             subtitle={parentDir}
             icon={icon}
