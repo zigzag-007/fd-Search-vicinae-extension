@@ -331,11 +331,11 @@ function getFileIcon(filePath: string, isDirectory: boolean): Icon {
   }
 
   if ([".pdf", ".doc", ".docx", ".txt", ".md", ".rtf"].includes(ext)) {
-    return Icon.Document;
+    return Icon.BlankDocument;
   }
 
   if ([".xls", ".xlsx", ".csv"].includes(ext)) {
-    return Icon.Spreadsheet;
+    return Icon.AppWindowGrid3x3;
   }
 
   if ([".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"].includes(ext)) {
@@ -354,7 +354,7 @@ function getFileIcon(filePath: string, isDirectory: boolean): Icon {
     return Icon.Terminal;
   }
 
-  return Icon.Document;
+  return Icon.BlankDocument;
 }
 
 function fuzzyMatch(pattern: string, text: string): { matches: boolean; score: number } {
