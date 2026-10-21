@@ -118,7 +118,7 @@ const MAX_REINDEX_AFTER_MINUTES = 20;
 const INDEX_REFRESH_POLL_MS = 3000;
 const CACHE_LOAD_YIELD_EVERY = 2000;
 const SEARCH_CHUNK_SIZE = 1500;
-const PARTIAL_RESULT_UPDATE_EVERY = 3000;
+const PARTIAL_RESULT_UPDATE_INTERVAL_MS = 32;
 
 function formatFileSize(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -728,10 +728,21 @@ function getScopedResultScore(entry: IndexEntry, pathScope: string): number {
   return 3500 - depthDelta * 10;
 }
 
-function getCachedMatchScore(searchQuery: string, entry: CachedIndexEntry): number {
+function prepareSearchQuery(searchQuery: string) {
   const queryLower = searchQuery.toLowerCase();
   const normalizedQuery = normalizeForSearch(searchQuery);
   const queryTokens = normalizedQuery.split(" ").filter(Boolean);
+  const typoLimit = normalizedQuery.length >= 7 ? 2 : 1;
+  const tokenDistances = new Map<string, number | null>();
+
+  return { queryLower, normalizedQuery, queryTokens, typoLimit, tokenDistances };
+}
+
+function getCachedMatchScore(
+  query: ReturnType<typeof prepareSearchQuery>,
+  entry: CachedIndexEntry,
+): number {
+  const { queryLower, normalizedQuery, queryTokens, typoLimit, tokenDistances } = query;
 
   if (!normalizedQuery) {
     return 0;
@@ -777,10 +788,16 @@ function getCachedMatchScore(searchQuery: string, entry: CachedIndexEntry): numb
     return 300 + pathFuzzy.score;
   }
 
-  const typoLimit = normalizedQuery.length >= 7 ? 2 : 1;
   if (normalizedQuery.length >= 4) {
     for (const token of entry.normalizedTokens) {
-      const distance = getEditDistanceWithinLimit(normalizedQuery, token, typoLimit);
+      if (Math.abs(normalizedQuery.length - token.length) > typoLimit) {
+        continue;
+      }
+      let distance = tokenDistances.get(token);
+      if (distance === undefined) {
+        distance = getEditDistanceWithinLimit(normalizedQuery, token, typoLimit);
+        tokenDistances.set(token, distance);
+      }
       if (distance !== null) {
         return distance === 0 ? 1600 : 900 - distance * 100;
       }
@@ -1209,7 +1226,6 @@ export default function Command() {
         entries: [],
         prefixIndex: new Map<string, number[]>(),
       };
-      cachedIndexRef.current = cachedIndexData;
       const fileStream = createReadStream(source.path, { encoding: "utf8" });
       const rl = readline.createInterface({
         input: fileStream,
@@ -1230,7 +1246,7 @@ export default function Command() {
           cachedIndexData.entries.push(cachedEntry);
 
           const prefixKeys = new Set<string>();
-          const tokens = cachedEntry.normalizedPath.split(" ").filter(Boolean);
+          const tokens = cachedEntry.normalizedTokens;
 
           for (const token of tokens) {
             const maxPrefixLength = Math.min(3, token.length);
@@ -1253,13 +1269,7 @@ export default function Command() {
             await new Promise<void>((resolve) => setImmediate(resolve));
           }
         }
-        cachedIndexPromiseRef.current = null;
-
-        if (latestQueryRef.current.trim() || latestFilterTypeRef.current !== "all") {
-          setImmediate(() => {
-            void runSearch(latestQueryRef.current);
-          });
-        }
+        cachedIndexRef.current = cachedIndexData;
 
         return cachedIndexData;
       } finally {
@@ -1298,7 +1308,20 @@ export default function Command() {
     setHasIndex(true);
     indexFingerprintRef.current = getIndexFingerprint(source);
     setLoading(true);
-    void loadCachedIndex(source);
+    let cachedIndexData: CachedIndexData;
+    try {
+      cachedIndexData = await loadCachedIndex(source);
+    } catch (error) {
+      if (searchGeneration === searchGenerationRef.current && !abortSignal.aborted) {
+        await showToast({
+          style: Toast.Style.Failure,
+          title: "Failed to load search index",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        setLoading(false);
+      }
+      return;
+    }
     const {
       pathScope,
       searchText,
@@ -1319,17 +1342,12 @@ export default function Command() {
       archives: [".zip", ".tar", ".gz", ".7z", ".rar", ".bz2"],
     };
 
-    const cachedIndexData = cachedIndexRef.current;
-    if (!cachedIndexData) {
-      setLoading(true);
-      return;
-    }
-
     if (searchGeneration !== searchGenerationRef.current || abortSignal.aborted) {
       return;
     }
 
     const candidateEntries = getCandidateEntries(cachedIndexData, pathScope, searchText);
+    const preparedQuery = prepareSearchQuery(searchText);
 
     const topMatches: ScoredResult[] = [];
 
@@ -1376,10 +1394,10 @@ export default function Command() {
       } else if (wildcardPattern) {
         if (wildcardPattern.test(cachedEntry.path) || wildcardPattern.test(cachedEntry.leafName)) {
           matches = true;
-          score = cachedEntry.path === searchText ? 2000 : getCachedMatchScore(searchText, cachedEntry);
+          score = cachedEntry.path === searchText ? 2000 : getCachedMatchScore(preparedQuery, cachedEntry);
         }
       } else {
-        score = getCachedMatchScore(searchText, cachedEntry);
+        score = getCachedMatchScore(preparedQuery, cachedEntry);
         if (score > 0) {
           matches = true;
         }
@@ -1400,6 +1418,7 @@ export default function Command() {
 
     try {
       let processedCount = 0;
+      let lastResultUpdate = Date.now();
 
       for (const cachedEntry of candidateEntries) {
         if (abortSignal.aborted) {
@@ -1409,21 +1428,22 @@ export default function Command() {
         processEntry(cachedEntry);
         processedCount += 1;
 
-        if (processedCount % PARTIAL_RESULT_UPDATE_EVERY === 0) {
-          if (searchGeneration === searchGenerationRef.current && !abortSignal.aborted) {
-            setResults(
-              topMatches.map((match) => ({
-                path: match.entry.path,
-                isDirectory: match.entry.isDirectory,
-                size: match.entry.size,
-                mtimeMs: match.entry.mtimeMs,
-                extension: match.entry.extension,
-              })),
-            );
-          }
-        }
-
         if (processedCount % SEARCH_CHUNK_SIZE === 0) {
+          const now = Date.now();
+          if (now - lastResultUpdate >= PARTIAL_RESULT_UPDATE_INTERVAL_MS) {
+            if (searchGeneration === searchGenerationRef.current && !abortSignal.aborted) {
+              setResults(
+                topMatches.map((match) => ({
+                  path: match.entry.path,
+                  isDirectory: match.entry.isDirectory,
+                  size: match.entry.size,
+                  mtimeMs: match.entry.mtimeMs,
+                  extension: match.entry.extension,
+                })),
+              );
+            }
+            lastResultUpdate = now;
+          }
           await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
@@ -1784,6 +1804,7 @@ export default function Command() {
 
   useEffect(() => {
     if (!query.trim() && filterType === "all") {
+      currentSearchAbort.current?.abort();
       setResults([]);
       setLoading(false);
       return;
@@ -1853,7 +1874,7 @@ export default function Command() {
           <List.Dropdown.Item title="Archives" value="archives" />
         </List.Dropdown>
       }
-      throttle
+      throttle={false}
     >
       {indexStatus === "building" && !hasIndex && (
         <List.EmptyView
